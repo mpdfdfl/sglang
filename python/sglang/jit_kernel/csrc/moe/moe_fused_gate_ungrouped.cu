@@ -50,6 +50,7 @@ __global__ void moe_fused_gate_ungrouped_kernel_small_token(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   static constexpr int WARPS_PER_TOKEN_SMALL = NUM_EXPERTS / WARP_SIZE;
+  static constexpr int MAX_TOPK = 8;
 
   int64_t row_idx = blockIdx.x;
   if (row_idx >= num_rows) return;
@@ -58,34 +59,30 @@ __global__ void moe_fused_gate_ungrouped_kernel_small_token(
   int warp_id = tid / WARP_SIZE;
   int lane_id = tid % WARP_SIZE;
 
-  __shared__ float shared_scores[NUM_EXPERTS];
+  // Sigmoid weights (no bias) for final lookup, indexed by expert id.
   __shared__ float shared_original_scores[NUM_EXPERTS];
-  __shared__ int selected_experts[8];
-  __shared__ float selected_vals[8];
   __shared__ float warp_maxs[WARPS_PER_TOKEN_SMALL];
   __shared__ int warp_experts[WARPS_PER_TOKEN_SMALL];
+  __shared__ int selected_experts[MAX_TOPK];
 
-  // Load data: all NUM_EXPERTS threads load one expert each
-  if (tid < NUM_EXPERTS) {
-    float input_val = input[row_idx * NUM_EXPERTS + tid];
-    float bias_val = bias[tid];
-    float sigmoid_val = 1.0f / (1.0f + expf(-input_val));
-    float biased_val = sigmoid_val + bias_val;
-    shared_scores[tid] = biased_val;
-    shared_original_scores[tid] = sigmoid_val;
-  }
+  // Keep biased_val in register; mask the winner in-place each iteration to
+  // avoid round-tripping through shared memory.
+  float input_val = input[row_idx * NUM_EXPERTS + tid];
+  float bias_val = bias[tid];
+  float sigmoid_val = 1.0f / (1.0f + expf(-input_val));
+  float biased_val = sigmoid_val + bias_val;
+  shared_original_scores[tid] = sigmoid_val;
 
   __syncthreads();
 
-  // Find top-k using iterative selection
+  // Lane 0 of warp 0 accumulates the renorm sum as it picks each winner,
+  // saving a second pass over selected_experts during writeback.
+  float sum_for_renorm = 0.0f;
+
   for (int k = 0; k < topk; k++) {
-    float my_val = (tid < NUM_EXPERTS) ? shared_scores[tid] : -FLT_MAX;
-    int my_expert = tid;
-
-    // Warp-level reduction
-    float warp_max_val = my_val;
-    int warp_max_expert = my_expert;
-
+    // Stage 1: per-warp argmax.
+    float warp_max_val = biased_val;
+    int warp_max_expert = tid;
 #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
       float other_val = __shfl_down_sync(0xFFFFFFFF, warp_max_val, offset);
@@ -95,19 +92,16 @@ __global__ void moe_fused_gate_ungrouped_kernel_small_token(
         warp_max_expert = other_expert;
       }
     }
-
     if (lane_id == 0) {
       warp_maxs[warp_id] = warp_max_val;
       warp_experts[warp_id] = warp_max_expert;
     }
-
     __syncthreads();
 
-    // Final reduction among warps (done by first warp)
+    // Stage 2: warp 0 merges warp-leaders into a single winner.
     if (warp_id == 0) {
       float final_max = (lane_id < WARPS_PER_TOKEN_SMALL) ? warp_maxs[lane_id] : -FLT_MAX;
       int final_expert = (lane_id < WARPS_PER_TOKEN_SMALL) ? warp_experts[lane_id] : -1;
-
 #pragma unroll
       for (int offset = 16; offset > 0; offset /= 2) {
         float other_val = __shfl_down_sync(0xFFFFFFFF, final_max, offset);
@@ -117,52 +111,35 @@ __global__ void moe_fused_gate_ungrouped_kernel_small_token(
           final_expert = other_expert;
         }
       }
-
       if (lane_id == 0) {
         selected_experts[k] = final_expert;
-        selected_vals[k] = final_max;
-      }
-    }
-
-    __syncthreads();
-
-    // Mark the selected expert as used
-    int selected = selected_experts[k];
-    if (tid == selected) {
-      shared_scores[tid] = -FLT_MAX;
-    }
-
-    __syncthreads();
-  }
-
-  // Write output (done by thread 0)
-  if (tid == 0) {
-    for (int k = 0; k < topk; k++) {
-      int expert_id = selected_experts[k];
-      if (expert_id >= 0 && expert_id < NUM_EXPERTS) {
-        output_ptr[row_idx * output_stride + k] = shared_original_scores[expert_id];
-        indices_ptr[row_idx * output_stride + k] = expert_id;
-      } else {
-        output_ptr[row_idx * output_stride + k] = 0.0f;
-        indices_ptr[row_idx * output_stride + k] = 0;
-      }
-    }
-
-    if (renormalize) {
-      float sum = 0.0f;
-      for (int k = 0; k < topk; k++) {
-        sum += output_ptr[row_idx * output_stride + k];
-      }
-
-      if (sum > 0.0f) {
-        for (int k = 0; k < topk; k++) {
-          int64_t idx = row_idx * output_stride + k;
-          output_ptr[idx] /= sum;
-          if (apply_routed_scaling_factor_on_output) {
-            output_ptr[idx] *= static_cast<float>(routed_scaling_factor);
-          }
+        if (renormalize && final_expert >= 0 && final_expert < NUM_EXPERTS) {
+          sum_for_renorm += shared_original_scores[final_expert];
         }
       }
+    }
+    __syncthreads();
+
+    int selected = selected_experts[k];
+    if (tid == selected) biased_val = -FLT_MAX;
+  }
+
+  // Lane 0 of warp 0 writes the output. sum_for_renorm was accumulated
+  // during the topk loop, so we just fold it into rcp.
+  if (warp_id == 0 && lane_id == 0) {
+    float rcp = 1.0f;
+    if (renormalize && sum_for_renorm > 0.0f) {
+      rcp = 1.0f / sum_for_renorm;
+      if (apply_routed_scaling_factor_on_output) {
+        rcp *= static_cast<float>(routed_scaling_factor);
+      }
+    }
+
+    for (int k = 0; k < topk; k++) {
+      int expert_id = selected_experts[k];
+      bool valid = (expert_id >= 0 && expert_id < NUM_EXPERTS);
+      output_ptr[row_idx * output_stride + k] = valid ? shared_original_scores[expert_id] * rcp : 0.0f;
+      indices_ptr[row_idx * output_stride + k] = valid ? expert_id : 0;
     }
   }
 }
@@ -182,102 +159,103 @@ __global__ void moe_fused_gate_ungrouped_kernel(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   static constexpr int VPT = NUM_EXPERTS / WARP_SIZE;
+  static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;
+  static constexpr int MAX_TOPK = 8;
 
   int64_t row_idx = blockIdx.x * WARPS_PER_CTA + threadIdx.y;
-  // Use valid-row predicate instead of early return to avoid __syncthreads deadlock
-  // when num_rows is not divisible by WARPS_PER_CTA.
-  bool valid_row = (row_idx < num_rows);
+  // Each warp owns one token; all 32 lanes of a warp share row_idx, so an early
+  // return is safe (no inter-warp sync below — only __syncwarp).
+  if (row_idx >= num_rows) return;
 
   int lane_id = threadIdx.x;
   int warp_id = threadIdx.y;
 
   __shared__ float shared_scores[NUM_EXPERTS * WARPS_PER_CTA];
   __shared__ float shared_original_scores[NUM_EXPERTS * WARPS_PER_CTA];
-
   float* warp_scores = shared_scores + warp_id * NUM_EXPERTS;
   float* warp_original_scores = shared_original_scores + warp_id * NUM_EXPERTS;
+  float4* warp_scores_v4 = reinterpret_cast<float4*>(warp_scores);
+  float4* warp_original_scores_v4 = reinterpret_cast<float4*>(warp_original_scores);
 
-  // Vectorized loading (only for valid rows)
-  if (valid_row) {
-    static constexpr int VEC_PER_LANE = VPT / VEC_SIZE;
-    float4* input_vec = reinterpret_cast<float4*>(input + row_idx * NUM_EXPERTS);
-    float4* bias_vec = reinterpret_cast<float4*>(bias);
+  float4* input_vec = reinterpret_cast<float4*>(input + row_idx * NUM_EXPERTS);
+  float4* bias_vec = reinterpret_cast<float4*>(bias);
 
+  // Lane-strided vec_idx (each lane k stores at vec_idx k, k+32, k+64, ...) so each
+  // iteration's STS.128 is lane-contiguous, avoiding shared-mem bank conflicts.
 #pragma unroll
-    for (int i = 0; i < VEC_PER_LANE; i++) {
-      int vec_idx = lane_id * VEC_PER_LANE + i;
-      float4 input_val = input_vec[vec_idx];
-      float4 bias_val = bias_vec[vec_idx];
+  for (int i = 0; i < VEC_PER_LANE; i++) {
+    int vec_idx = lane_id + i * WARP_SIZE;
+    float4 input_val = input_vec[vec_idx];
+    float4 bias_val = bias_vec[vec_idx];
 
+    float4 sigmoid_v4;
+    float4 biased_v4;
 #pragma unroll
-      for (int j = 0; j < VEC_SIZE; j++) {
-        int expert = vec_idx * VEC_SIZE + j;
-        float inp = ((float*)&input_val)[j];
-        float b = ((float*)&bias_val)[j];
-        float sigmoid_val = 1.0f / (1.0f + expf(-inp));
-        float biased_val = sigmoid_val + b;
-        warp_scores[expert] = biased_val;
-        warp_original_scores[expert] = sigmoid_val;
-      }
+    for (int j = 0; j < VEC_SIZE; j++) {
+      float inp = ((float*)&input_val)[j];
+      float b = ((float*)&bias_val)[j];
+      float sigmoid_val = 1.0f / (1.0f + expf(-inp));
+      ((float*)&sigmoid_v4)[j] = sigmoid_val;
+      ((float*)&biased_v4)[j] = sigmoid_val + b;
     }
+    warp_original_scores_v4[vec_idx] = sigmoid_v4;
+    warp_scores_v4[vec_idx] = biased_v4;
   }
 
-  __syncthreads();
+  __syncwarp();
+
+  // Lane 0 records the picked expert ids and accumulates the renorm sum as
+  // it goes; the global write is a single pass after the loop.
+  int top_indices[MAX_TOPK];
+  float sum_for_renorm = 0.0f;
 
   for (int k = 0; k < topk; k++) {
     float max_val = -FLT_MAX;
     int max_expert = -1;
 
-    if (valid_row) {
-      for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
-        if (warp_scores[expert] > max_val) {
-          max_val = warp_scores[expert];
-          max_expert = expert;
-        }
+    for (int expert = lane_id; expert < NUM_EXPERTS; expert += WARP_SIZE) {
+      if (warp_scores[expert] > max_val) {
+        max_val = warp_scores[expert];
+        max_expert = expert;
       }
     }
 
+    // warp shfl reduce; tie-break by lower expert id
+#pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
       float other_val = __shfl_down_sync(0xFFFFFFFF, max_val, offset);
       int other_expert = __shfl_down_sync(0xFFFFFFFF, max_expert, offset);
-
       if (other_val > max_val || (other_val == max_val && other_expert < max_expert)) {
         max_val = other_val;
         max_expert = other_expert;
       }
     }
 
-    if (valid_row && lane_id == 0) {
-      int64_t output_idx = row_idx * output_stride + k;
-      if (max_expert != -1) {
-        output_ptr[output_idx] = warp_original_scores[max_expert];
-        indices_ptr[output_idx] = max_expert;
-        warp_scores[max_expert] = -FLT_MAX;
-      } else {
-        output_ptr[output_idx] = 0.0f;
-        indices_ptr[output_idx] = 0;
+    if (lane_id == 0) {
+      bool valid = (max_expert >= 0 && max_expert < NUM_EXPERTS);
+      top_indices[k] = valid ? max_expert : -1;
+      if (renormalize && valid) {
+        sum_for_renorm += warp_original_scores[max_expert];
       }
+      if (valid) warp_scores[max_expert] = -FLT_MAX;
     }
-
     __syncwarp();
   }
 
-  __syncthreads();
-
-  if (valid_row && renormalize && lane_id == 0) {
-    float sum = 0.0f;
-    for (int k = 0; k < topk; k++) {
-      sum += output_ptr[row_idx * output_stride + k];
+  if (lane_id == 0) {
+    float rcp = 1.0f;
+    if (renormalize && sum_for_renorm > 0.0f) {
+      rcp = 1.0f / sum_for_renorm;
+      if (apply_routed_scaling_factor_on_output) {
+        rcp *= static_cast<float>(routed_scaling_factor);
+      }
     }
 
-    if (sum > 0.0f) {
-      for (int k = 0; k < topk; k++) {
-        int64_t idx = row_idx * output_stride + k;
-        output_ptr[idx] /= sum;
-        if (apply_routed_scaling_factor_on_output) {
-          output_ptr[idx] *= static_cast<float>(routed_scaling_factor);
-        }
-      }
+    for (int k = 0; k < topk; k++) {
+      int e = top_indices[k];
+      bool valid = (e >= 0);
+      output_ptr[row_idx * output_stride + k] = valid ? warp_original_scores[e] * rcp : 0.0f;
+      indices_ptr[row_idx * output_stride + k] = valid ? e : 0;
     }
   }
 }
